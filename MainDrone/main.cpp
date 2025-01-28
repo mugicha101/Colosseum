@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "common/common_utils/StrictMode.hpp"
+#include "common/AirSimSettings.hpp"
 STRICT_MODE_OFF
 #ifndef RPCLIB_MSGPACK
 #define RPCLIB_MSGPACK clmdep_msgpack
@@ -16,18 +17,38 @@ STRICT_MODE_ON
 #include <tuple>
 #include <utility>
 #include <random>
+#include <thread>
 
-int main()
-{
+void camera_handler(msr::airlib::MultirotorRpcLibClient& client) {
     using namespace msr::airlib;
-
-    msr::airlib::MultirotorRpcLibClient client;
+    using namespace std::chrono;
+    
     typedef ImageCaptureBase::ImageRequest ImageRequest;
     typedef ImageCaptureBase::ImageResponse ImageResponse;
     typedef ImageCaptureBase::ImageType ImageType;
     typedef common_utils::FileSystem FileSystem;
 
+    // poll camera at set frequency
+    time_point start = system_clock::now();
+    int count = 0;
+    while (client.isApiControlEnabled()) {
+        const std::vector<ImageRequest> request{ ImageRequest("front_left", ImageType::Scene, false), ImageRequest("front_right", ImageType::Scene, false) };
+        client.simGetImages(request);
+        // std::this_thread::sleep_until(next_poll);
+        ++count;
+        std::cout << "poll cam hz: " << (double)count / duration<double>(system_clock::now() - start).count() << std::endl;
+    }
+}
+
+int main() {
+    using namespace msr::airlib;
+
+    msr::airlib::MultirotorRpcLibClient client;
+
     try {
+        // copy local settings.json into used settings.json (TODO)
+        // Note: store actual location in .env (depends on machine)
+
         client.confirmConnection();
         srand((unsigned int)time(0));
 
@@ -72,50 +93,38 @@ int main()
                   << "magnetometer_data.magnetic_field_body \t" << magnetometer_data.magnetic_field_body << std::endl;
         // << "magnetometer_data.magnetic_field_covariance" << magnetometer_data.magnetic_field_covariance // not implemented in sensor
 
+        // start camera thread
+        client.enableApiControl(true);
+        std::thread cam_thread(camera_handler, std::ref(client));
+        constexpr float speed = 15.f;
+
         std::cout << "Takeoff" << std::endl;
         float takeoff_timeout = 3;
         client.takeoffAsync(takeoff_timeout)->waitOnLastTask();
 
         // switch to explicit hover mode so that this is the fall back when
         // move* commands are finished.
-        std::this_thread::sleep_for(std::chrono::duration<double>(5));
+        std::this_thread::sleep_for(std::chrono::duration<double>(3));
         client.hoverAsync()->waitOnLastTask();
 
-        std::vector<msr::airlib::Vector3r> points(100);
-        for (int i = 0; i < (int)points.size(); ++i) {
-            auto& p = points[i];
-            p.x() = randf(-20.f, 20.f);
-            p.y() = randf(-20.f, 20.f);
-            p.z() = randf(-20.f, -10.f);
-        }
-
-        client.enableApiControl(true);
-
         auto origin = client.getMultirotorState().getPosition();
-        // float z = position.z(); // current position (NED coordinate system).
-        constexpr float speed = 15.0f;
-        // constexpr float size = 10.0f;
-        // constexpr float duration = size / speed;
-        // DrivetrainType drivetrain = DrivetrainType::MaxDegreeOfFreedom;
-        // YawMode yaw_mode(true, 0);
-
-        // move to absolute position
-        auto moveTo = [&client](float x, float y, float z, float speed) {
-            return client.moveToPositionAsync(x, y, z, speed); 
-        };
-
-        for (auto& p : points) {
-            std::cout << "Move to " << origin.x() + p.x() << ", " << origin.y() + p.y() << ", " << origin.z() + p.z() << std::endl;
-            moveTo(origin.x() + p.x(), origin.y() + p.y(), origin.z() + p.z(), speed)->waitOnLastTask();
-            auto pos = client.getMultirotorState().getPosition();
-            std::cout << "At " << pos.x() << ", " << pos.y() << ", " << pos.z() << std::endl;
+        std::vector<msr::airlib::Vector3r> path(50);
+        for (int i = 0; i < (int)path.size(); ++i) {
+            auto& p = path[i];
+            p.x() = randf(-20.f, 20.f) + origin.x();
+            p.y() = randf(-20.f, 20.f) + origin.y();
+            p.z() = randf(-20.f, -10.f) + origin.z();
         }
-        std::cout << "Move to origin" << std::endl;
-        moveTo(origin.x(), origin.y(), origin.z(), speed * 0.25f)->waitOnLastTask();
+        path.push_back(origin);
+
+        client.moveOnPathAsync(path, speed, INFINITY, DrivetrainType::ForwardOnly, YawMode{false, 0.f})->waitOnLastTask();
 
         std::cout << "Landing" << std::endl;
         client.landAsync()->waitOnLastTask();
+
+        client.enableApiControl(false);
         client.armDisarm(false);
+        cam_thread.join();
     }
     catch (rpc::rpc_error& e) {
         const auto msg = e.get_error().as<std::string>();
